@@ -15,9 +15,11 @@
  */
 package org.teavm.classlib.java.lang;
 
+import org.teavm.classlib.PlatformDetector;
 import org.teavm.dependency.PluggableDependency;
 import org.teavm.interop.Address;
 import org.teavm.interop.Async;
+import org.teavm.interop.AsyncCallback;
 import org.teavm.interop.DelegateTo;
 import org.teavm.interop.Rename;
 import org.teavm.interop.Structure;
@@ -28,8 +30,8 @@ import org.teavm.platform.Platform;
 import org.teavm.platform.PlatformObject;
 import org.teavm.platform.PlatformQueue;
 import org.teavm.platform.PlatformRunnable;
-import org.teavm.platform.async.AsyncCallback;
 import org.teavm.runtime.Allocator;
+import org.teavm.runtime.EventQueue;
 import org.teavm.runtime.RuntimeArray;
 import org.teavm.runtime.RuntimeClass;
 import org.teavm.runtime.RuntimeObject;
@@ -39,25 +41,31 @@ public class TObject {
     Monitor monitor;
 
     static class Monitor {
+        static final int MASK = 0x80000000;
+
         PlatformQueue<PlatformRunnable> enteringThreads;
         PlatformQueue<NotifyListener> notifyListeners;
         TThread owner;
         int count;
+        int id;
 
-        public Monitor() {
+        Monitor() {
             this.owner = TThread.currentThread();
             enteringThreads = Platform.createQueue();
             notifyListeners = Platform.createQueue();
         }
     }
 
-    interface NotifyListener extends PlatformRunnable {
+    interface NotifyListener extends PlatformRunnable, EventQueue.Event {
         boolean expired();
     }
 
     static void monitorEnterSync(TObject o) {
         if (o.monitor == null) {
             o.monitor = new Monitor();
+            if (PlatformDetector.isLowLevel()) {
+                o.monitor.id = o.identity();
+            }
         }
         if (o.monitor.owner == null) {
             o.monitor.owner = TThread.currentThread();
@@ -84,6 +92,9 @@ public class TObject {
     static void monitorEnter(TObject o, int count) {
         if (o.monitor == null) {
             o.monitor = new Monitor();
+            if (PlatformDetector.isLowLevel()) {
+                o.monitor.id = o.identity();
+            }
         }
         if (o.monitor.owner == null) {
             o.monitor.owner = TThread.currentThread();
@@ -102,6 +113,7 @@ public class TObject {
         final TThread thread = TThread.currentThread();
         if (o.monitor == null) {
             o.monitor = new Monitor();
+            o.monitor.id = o.identity();
             TThread.setCurrentThread(thread);
             o.monitor.count += count;
             callback.complete(null);
@@ -122,12 +134,12 @@ public class TObject {
     }
 
     @Sync
-    static void monitorExit(final TObject o) {
+    static void monitorExit(TObject o) {
         monitorExit(o, 1);
     }
 
     @Sync
-    static void monitorExit(final TObject o, int count) {
+    static void monitorExit(TObject o, int count) {
         if (o.isEmptyMonitor() || o.monitor.owner != TThread.currentThread()) {
             throw new TIllegalMonitorStateException();
         }
@@ -138,16 +150,22 @@ public class TObject {
 
         o.monitor.owner = null;
         if (!o.monitor.enteringThreads.isEmpty()) {
-            Platform.postpone(() -> {
-                if (o.isEmptyMonitor() || o.monitor.owner != null) {
-                    return;
-                }
-                if (!o.monitor.enteringThreads.isEmpty()) {
-                    o.monitor.enteringThreads.remove().run();
-                }
-            });
+            if (PlatformDetector.isLowLevel()) {
+                EventQueue.offer(() -> waitForOtherThreads(o));
+            } else {
+                Platform.postpone(() -> waitForOtherThreads(o));
+            }
         } else {
             o.isEmptyMonitor();
+        }
+    }
+
+    private static void waitForOtherThreads(TObject o) {
+        if (o.isEmptyMonitor() || o.monitor.owner != null) {
+            return;
+        }
+        if (!o.monitor.enteringThreads.isEmpty()) {
+            o.monitor.enteringThreads.remove().run();
         }
     }
 
@@ -156,7 +174,13 @@ public class TObject {
             return true;
         }
         if (monitor.owner == null && monitor.enteringThreads.isEmpty() && monitor.notifyListeners.isEmpty()) {
-            monitor = null;
+            if (PlatformDetector.isLowLevel()) {
+                int id = monitor.id;
+                monitor = null;
+                setIdentity(id);
+            } else {
+                monitor = null;
+            }
             return true;
         } else {
             return false;
@@ -200,14 +224,20 @@ public class TObject {
         return getClass().getName() + "@" + TInteger.toHexString(identity());
     }
 
-    @DelegateTo("identityLowLevel")
     int identity() {
+        if (PlatformDetector.isLowLevel()) {
+            int result = monitor.id;
+            return ((result & Monitor.MASK) != 0) ? monitor.id : identityImpl();
+        }
         PlatformObject platformThis = Platform.getPlatformObject(this);
         if (platformThis.getId() == 0) {
             platformThis.setId(Platform.nextObjectId());
         }
         return Platform.getPlatformObject(this).getId();
     }
+
+    @DelegateTo("identityLowLevel")
+    private native int identityImpl();
 
     @SuppressWarnings("unused")
     private static int identityLowLevel(RuntimeObject object) {
@@ -220,6 +250,20 @@ public class TObject {
             object.hashCode = result;
         }
         return result;
+    }
+
+    @DelegateTo("identityOrMonitorLowLevel")
+    private native int identityOrMonitor();
+
+    private static int identityOrMonitorLowLevel(RuntimeObject object) {
+        return object.hashCode;
+    }
+
+    @DelegateTo("setIdentityLowLevel")
+    native void setIdentity(int id);
+
+    private static void setIdentityLowLevel(RuntimeObject object, int id) {
+        object.hashCode = id;
     }
 
     @Override
@@ -267,7 +311,11 @@ public class TObject {
         while (!listeners.isEmpty()) {
             NotifyListener listener = listeners.remove();
             if (!listener.expired()) {
-                Platform.postpone(listener);
+                if (PlatformDetector.isLowLevel()) {
+                    EventQueue.offer(listener);
+                } else {
+                    Platform.postpone(listener);
+                }
                 break;
             }
         }
@@ -283,7 +331,11 @@ public class TObject {
         while (!listeners.isEmpty()) {
             NotifyListener listener = listeners.remove();
             if (!listener.expired()) {
-                Platform.postpone(listener);
+                if (PlatformDetector.isLowLevel()) {
+                    EventQueue.offer(listener);
+                } else {
+                    Platform.postpone(listener);
+                }
             }
         }
     }
@@ -313,13 +365,15 @@ public class TObject {
         monitor.notifyListeners.add(listener);
         TThread.currentThread().interruptHandler = listener;
         if (timeout > 0 || nanos > 0) {
-            listener.timerId = Platform.schedule(listener, timeout >= Integer.MAX_VALUE ? Integer.MAX_VALUE
-                    : (int) timeout);
+            int timeoutToSchedule = timeout >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) timeout;
+            listener.timerId = PlatformDetector.isLowLevel()
+                    ? EventQueue.offer(listener, timeoutToSchedule + System.currentTimeMillis())
+                    : Platform.schedule(listener, timeoutToSchedule);
         }
         monitorExit(this, monitor.count);
     }
 
-    private static class NotifyListenerImpl implements NotifyListener, TimerHandler, PlatformRunnable,
+    static class NotifyListenerImpl implements NotifyListener, TimerHandler, PlatformRunnable,
             TThreadInterruptHandler {
         final TObject obj;
         final AsyncCallback<Void> callback;
@@ -329,7 +383,7 @@ public class TObject {
         boolean performed;
         int lockCount;
 
-        public NotifyListenerImpl(TObject obj, AsyncCallback<Void> callback, int lockCount) {
+        NotifyListenerImpl(TObject obj, AsyncCallback<Void> callback, int lockCount) {
             this.obj = obj;
             this.callback = callback;
             this.lockCount = lockCount;
@@ -344,11 +398,19 @@ public class TObject {
 
         @Override
         public void onTimer() {
-            Platform.postpone(() -> {
-                if (!expired()) {
-                    run();
-                }
-            });
+            if (PlatformDetector.isLowLevel()) {
+                EventQueue.offer(() -> {
+                    if (!expired()) {
+                        run();
+                    }
+                });
+            } else {
+                Platform.postpone(() -> {
+                    if (!expired()) {
+                        run();
+                    }
+                });
+            }
         }
 
         @Override
@@ -358,7 +420,11 @@ public class TObject {
             }
             performed = true;
             if (timerId >= 0) {
-                Platform.killSchedule(timerId);
+                if (PlatformDetector.isLowLevel()) {
+                    EventQueue.kill(timerId);
+                } else {
+                    Platform.killSchedule(timerId);
+                }
                 timerId = -1;
             }
             TThread.setCurrentThread(currentThread);
@@ -372,10 +438,18 @@ public class TObject {
             }
             performed = true;
             if (timerId >= 0) {
-                Platform.killSchedule(timerId);
+                if (PlatformDetector.isLowLevel()) {
+                    EventQueue.kill(timerId);
+                } else {
+                    Platform.killSchedule(timerId);
+                }
                 timerId = -1;
             }
-            Platform.postpone(() -> callback.error(new TInterruptedException()));
+            if (PlatformDetector.isLowLevel()) {
+                EventQueue.offer(() -> callback.error(new TInterruptedException()));
+            } else {
+                Platform.postpone(() -> callback.error(new TInterruptedException()));
+            }
         }
     }
 
